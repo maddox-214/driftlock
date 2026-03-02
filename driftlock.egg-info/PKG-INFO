@@ -1,0 +1,225 @@
+Metadata-Version: 2.4
+Name: driftlock
+Version: 0.1.0
+Summary: Lightweight LLM cost & token tracking middleware for OpenAI
+License: MIT
+Keywords: openai,llm,cost,tokens,monitoring,middleware
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: openai>=1.0.0
+Provides-Extra: fastapi
+Requires-Dist: fastapi>=0.110.0; extra == "fastapi"
+Requires-Dist: uvicorn[standard]>=0.29.0; extra == "fastapi"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-mock>=3.14; extra == "dev"
+Requires-Dist: httpx>=0.27; extra == "dev"
+Requires-Dist: ruff>=0.4; extra == "dev"
+
+# Driftlock
+
+**Lightweight LLM cost & token tracking middleware for Python.**
+
+Drop Driftlock into your project in under 5 minutes. It wraps the OpenAI Python SDK transparently, giving you per-call token counts, real-time cost estimates, latency measurement, and persistent local metrics — with zero changes to your existing call sites.
+
+---
+
+## Why Driftlock?
+
+LLM costs compound quietly. A prompt that's 20% too long, a model that's one tier too expensive, a function calling GPT-4o when GPT-4o-mini would do — these are hard to catch without instrumentation.
+
+Driftlock makes the cost of every LLM call visible at the point of code, not three weeks later in a billing alert.
+
+---
+
+## Install
+
+```bash
+pip install driftlock
+```
+
+With FastAPI support:
+
+```bash
+pip install "driftlock[fastapi]"
+```
+
+---
+
+## 5-Minute Integration
+
+```python
+from driftlock import DriftlockClient
+
+# Swap openai.OpenAI() → DriftlockClient()
+# Every other argument is forwarded to the OpenAI client unchanged.
+client = DriftlockClient(api_key="sk-...")
+
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+```
+
+That's it. You get structured logs on every call:
+
+```json
+{
+  "level": "INFO",
+  "logger": "driftlock",
+  "message": "model=gpt-4o-mini | tokens=157 | latency=421ms | cost=$0.000033",
+  "metrics": {
+    "timestamp": "2025-03-01T12:00:00+00:00",
+    "model": "gpt-4o-mini",
+    "prompt_tokens": 120,
+    "completion_tokens": 37,
+    "total_tokens": 157,
+    "latency_ms": 421.3,
+    "estimated_cost_usd": 0.0000330,
+    "endpoint": null,
+    "labels": {},
+    "warnings": []
+  }
+}
+```
+
+---
+
+## Configuration
+
+```python
+from driftlock import DriftlockClient, DriftlockConfig
+
+config = DriftlockConfig(
+    log_json=True,                         # JSON logs (default). False = human-readable.
+    log_level="INFO",                      # Standard log level.
+    storage_backend="sqlite",             # "sqlite" | "none"
+    db_path="driftlock.db",               # SQLite file path.
+    prompt_token_warning_threshold=4000,  # Warn if prompt > N tokens.
+    cost_warning_threshold=0.10,          # Warn if a single call costs > $X.
+    default_labels={"env": "prod"},       # Attached to every tracked call.
+)
+
+client = DriftlockClient(api_key="sk-...", config=config)
+```
+
+---
+
+## Labelling Calls
+
+Use `_dl_endpoint` and `_dl_labels` to annotate individual calls. These are stripped before the request reaches OpenAI.
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[...],
+    _dl_endpoint="summarise_article",        # logical function name
+    _dl_labels={"user_id": "u_123"},         # arbitrary key/value metadata
+)
+```
+
+---
+
+## Reading Metrics
+
+```python
+# Aggregate stats (all time)
+client.stats()
+# {'calls': 42, 'total_tokens': 18500, 'total_cost_usd': 0.003245, ...}
+
+# Filter by endpoint or model
+client.stats(endpoint="summarise_article")
+client.stats(model="gpt-4o")
+
+# Filter since a timestamp (ISO 8601)
+client.stats(since="2025-03-01T00:00:00+00:00")
+
+# Recent calls
+client.recent_calls(limit=10)
+```
+
+---
+
+## FastAPI Example
+
+See [examples/fastapi_app.py](examples/fastapi_app.py) for a working FastAPI integration.
+
+```bash
+OPENAI_API_KEY=sk-... uvicorn examples.fastapi_app:app --reload
+```
+
+Key endpoints:
+
+| Route | Description |
+|---|---|
+| `POST /chat` | Chat with GPT, tracked under `endpoint=chat` |
+| `POST /summarise` | Summarise text, tracked under `endpoint=summarise` |
+| `GET /metrics` | Aggregated stats by endpoint |
+| `GET /metrics/recent` | Last N calls |
+
+---
+
+## Warnings
+
+Driftlock emits warnings (elevated to `WARNING` log level) when:
+
+- **Prompt is too large** — prompt token count exceeds `prompt_token_warning_threshold`
+- **Call is expensive** — estimated cost exceeds `cost_warning_threshold`
+
+Warnings are also stored in the local SQLite record for later inspection.
+
+---
+
+## Project Structure
+
+```
+driftlock/
+├── __init__.py          # Public API: DriftlockClient, DriftlockConfig
+├── client.py            # Main wrapper — DriftlockClient + chat interceptor
+├── config.py            # DriftlockConfig dataclass
+├── metrics.py           # CallMetrics dataclass
+├── pricing.py           # Model pricing table + cost estimator
+├── storage.py           # SQLiteStorage + NoopStorage
+└── logger.py            # Structured JSON logger
+
+examples/
+├── basic_usage.py       # Minimal script example
+└── fastapi_app.py       # Full FastAPI integration
+
+tests/
+├── test_pricing.py
+├── test_client.py
+└── test_storage.py
+```
+
+---
+
+## Roadmap
+
+| Feature | Status |
+|---|---|
+| OpenAI chat wrapper | ✅ |
+| Token tracking | ✅ |
+| Cost estimation | ✅ |
+| Latency measurement | ✅ |
+| SQLite storage | ✅ |
+| Structured JSON logging | ✅ |
+| Prompt-length warnings | ✅ |
+| Cost-per-call warnings | ✅ |
+| Async (`acreate`) support | Planned |
+| Anthropic / Gemini adapters | Planned |
+| Smart model routing | Planned |
+| Prompt compression hooks | Planned |
+| Per-user / per-team budget caps | Planned |
+| OpenTelemetry export | Planned |
+
+---
+
+## License
+
+MIT
