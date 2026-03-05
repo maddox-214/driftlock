@@ -33,7 +33,7 @@ Requires Python ≥ 3.11.
 Clone the repo and run the full interactive demo:
 
 ```bash
-git clone https://github.com/your-org/driftlock && cd driftlock
+git clone https://github.com/maddox-214/driftlock && cd driftlock
 pip install -e .
 python examples/demo.py
 ```
