@@ -19,7 +19,8 @@ class CallMetrics:
     latency_ms: float
     estimated_cost_usd: float | None
 
-    # Routing / labelling
+    # Provider and routing / labelling
+    provider: str = "openai"
     endpoint: str | None = None
     labels: dict = field(default_factory=dict)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -40,6 +41,9 @@ class CallMetrics:
     sampled_out: bool = False
     quality_regression: bool = False
 
+    # Prompt drift fingerprint (hash of template portion of the prompt)
+    prompt_hash: str | None = None
+
     # Cache fields (populated on a cache hit; zero/None otherwise)
     cache_hit: bool = False
     cache_key: str | None = None          # first 8 chars of the SHA-256 key (log prefix)
@@ -50,6 +54,7 @@ class CallMetrics:
     def to_dict(self) -> dict:
         d = {
             "timestamp": self.timestamp.isoformat(),
+            "provider": self.provider,
             "model": self.model,
             "endpoint": self.endpoint,
             "prompt_tokens": self.prompt_tokens,
@@ -60,6 +65,7 @@ class CallMetrics:
             "labels": self.labels,
             "warnings": self.warnings,
             "request_id": self.request_id,
+            "prompt_hash": self.prompt_hash,
             "cache_hit": self.cache_hit,
             "optimization_enabled": self.optimization_enabled,
             "optimization_shadow": self.optimization_shadow,

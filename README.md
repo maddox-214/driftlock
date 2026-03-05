@@ -1,40 +1,85 @@
 # Driftlock
 
-**Lightweight LLM cost & token tracking middleware for Python.**
+**LLM cost governance and control layer for Python.**
 
-Drop Driftlock into your project in under 5 minutes. It wraps the OpenAI Python SDK transparently, giving you per-call token counts, real-time cost estimates, latency measurement, and persistent local metrics — with zero changes to your existing call sites.
-
----
-
-## Why Driftlock?
-
-LLM costs compound quietly. A prompt that's 20% too long, a model that's one tier too expensive, a function calling GPT-4o when GPT-4o-mini would do — these are hard to catch without instrumentation.
-
-Driftlock makes the cost of every LLM call visible at the point of code, not three weeks later in a billing alert.
+Driftlock sits between your application and LLM providers (OpenAI, Anthropic). It enforces cost policies, detects runaway spending, tracks per-call telemetry, and prevents budget overruns — with a drop-in API wrapper and zero changes to existing call sites.
 
 ---
 
 ## Install
 
+Not yet on PyPI. Install directly from source:
+
 ```bash
-pip install driftlock
+git clone https://github.com/your-org/driftlock
+cd driftlock
+pip install -e .
+```
+
+With Anthropic support:
+
+```bash
+pip install -e ".[anthropic]"
 ```
 
 With FastAPI support:
 
 ```bash
-pip install "driftlock[fastapi]"
+pip install -e ".[fastapi]"
+```
+
+Requires Python ≥ 3.11.
+
+---
+
+## Try It Now (no API key needed)
+
+```bash
+git clone https://github.com/your-org/driftlock && cd driftlock
+pip install -e .
+python examples/demo.py
+```
+
+This runs a fully-mocked demo in-process — no API key, no network calls, no cost. It exercises every major feature: tracking, optimization, budget guardrails, cache, and context tags.
+
+---
+
+## 60-Second Quickstart (real API)
+
+```bash
+export OPENAI_API_KEY=sk-...       # or ANTHROPIC_API_KEY=sk-ant-...
+driftlock demo
+```
+
+Driftlock makes one cheap request (`gpt-4o-mini` or `claude-haiku-4-5`) under a default policy and prints a receipt:
+
+```
+Driftlock demo  —  provider=openai  model=gpt-4o-mini
+
+  ┌─ Receipt ──────────────────────────────────────────────┐
+  │  provider  : openai                                    │
+  │  model     : gpt-4o-mini                               │
+  │  tokens    : 23 (15 in / 8 out)                        │
+  │  cost      : $0.000007                                 │
+  │  latency   : 412 ms                                    │
+  │  db        : ./driftlock.sqlite                        │
+  └────────────────────────────────────────────────────────┘
+
+  Next steps:
+    driftlock stats            # aggregate cost + token totals
+    driftlock recent           # last 20 calls
+    driftlock forecast         # projected monthly spend
 ```
 
 ---
 
-## 5-Minute Integration
+## Basic Integration — OpenAI
 
 ```python
 from driftlock import DriftlockClient
 
-# Swap openai.OpenAI() → DriftlockClient()
-# Every other argument is forwarded to the OpenAI client unchanged.
+# Replace openai.OpenAI() with DriftlockClient().
+# All other arguments are forwarded to the OpenAI client unchanged.
 client = DriftlockClient(api_key="sk-...")
 
 response = client.chat.completions.create(
@@ -43,7 +88,7 @@ response = client.chat.completions.create(
 )
 ```
 
-That's it. You get structured logs on every call:
+Every call is logged, costed, and saved to a local SQLite file.
 
 ```json
 {
@@ -57,13 +102,83 @@ That's it. You get structured logs on every call:
     "completion_tokens": 37,
     "total_tokens": 157,
     "latency_ms": 421.3,
-    "estimated_cost_usd": 0.0000330,
-    "endpoint": null,
-    "labels": {},
-    "warnings": []
+    "estimated_cost_usd": 0.0000330
   }
 }
 ```
+
+### Async
+
+```python
+response = await client.chat.completions.acreate(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+```
+
+### Streaming
+
+```python
+for chunk in client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Tell me a story."}],
+    stream=True,
+):
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+# Metrics are logged and saved when the stream closes.
+```
+
+---
+
+## Basic Integration — Anthropic
+
+Requires `pip install -e ".[anthropic]"`.
+
+```python
+from driftlock import AnthropicDriftlockClient
+
+client = AnthropicDriftlockClient(api_key="sk-ant-...")
+
+response = client.messages.create(
+    model="claude-3-5-sonnet-20241022",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+```
+
+`max_tokens` is required by Anthropic. The `system` parameter is a top-level kwarg, not a message role — same as the native SDK.
+
+---
+
+## Labelling Calls
+
+Use `_dl_endpoint` and `_dl_labels` to annotate individual calls. These are stripped before the request reaches the provider.
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[...],
+    _dl_endpoint="summarise_article",        # logical function name
+    _dl_labels={"user_id": "u_123", "team": "growth"},
+)
+```
+
+`user_id` and `team_id` in labels are indexed in SQLite for fast per-user queries.
+
+---
+
+## Ambient Tagging
+
+Attach labels to all calls within a scope without modifying every call site — useful in middleware:
+
+```python
+import driftlock
+
+with driftlock.tag(request_id="req_abc", user_id="u_42", feature="chat"):
+    response = client.chat.completions.create(...)
+```
+
+Tags from nested `driftlock.tag()` blocks merge; inner values override outer ones. Per-call `_dl_labels` always wins.
 
 ---
 
@@ -74,9 +189,9 @@ from driftlock import DriftlockClient, DriftlockConfig
 
 config = DriftlockConfig(
     log_json=True,                         # JSON logs (default). False = human-readable.
-    log_level="INFO",                      # Standard log level.
+    log_level="INFO",
     storage_backend="sqlite",             # "sqlite" | "none"
-    db_path="driftlock.db",               # SQLite file path.
+    db_path="driftlock.sqlite",
     prompt_token_warning_threshold=4000,  # Warn if prompt > N tokens.
     cost_warning_threshold=0.10,          # Warn if a single call costs > $X.
     default_labels={"env": "prod"},       # Attached to every tracked call.
@@ -87,63 +202,117 @@ client = DriftlockClient(api_key="sk-...", config=config)
 
 ---
 
-## Labelling Calls
+## Policy Engine
 
-Use `_dl_endpoint` and `_dl_labels` to annotate individual calls. These are stripped before the request reaches OpenAI.
+The policy engine enforces governance rules before every API call. Rules are evaluated in order; the first block raises `PolicyViolationError`.
 
 ```python
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[...],
-    _dl_endpoint="summarise_article",        # logical function name
-    _dl_labels={"user_id": "u_123"},         # arbitrary key/value metadata
+from driftlock import (
+    DriftlockClient,
+    PolicyEngine,
+    MonthlyBudgetRule,
+    MaxCostPerRequestRule,
+    VelocityLimitRule,
+    CostVelocityRule,
+    PerUserBudgetRule,
+    ForecastBudgetRule,
+    RestrictModelRule,
+    TagBasedModelDowngradeRule,
+    PolicyViolationError,
+)
+
+policy = PolicyEngine(rules=[
+    MonthlyBudgetRule(max_usd=100.0),                 # Block at $100/month workspace
+    MaxCostPerRequestRule(max_usd=0.10),              # Block single calls > $0.10
+    VelocityLimitRule(max_requests=60, window_seconds=60),  # 60 req/min circuit breaker
+])
+
+client = DriftlockClient(api_key="sk-...", policy=policy)
+
+try:
+    response = client.chat.completions.create(...)
+except PolicyViolationError as e:
+    print(f"Blocked by {e.rule_name}: {e.decision.metadata}")
+```
+
+### Available Rules
+
+| Rule | What it does |
+|---|---|
+| `MonthlyBudgetRule(max_usd, scope="workspace"\|"user")` | Block once monthly spend cap is reached |
+| `MaxCostPerRequestRule(max_usd)` | Block a single call if estimated cost exceeds the limit |
+| `PerUserBudgetRule(user_budgets, default_max_usd)` | Per-user monthly caps from a dict |
+| `ForecastBudgetRule(monthly_budget_usd, lookback_days=7)` | Block when projected 30-day spend will exceed budget |
+| `VelocityLimitRule(max_requests, window_seconds, scope="workspace"\|"user")` | Circuit breaker on request rate |
+| `CostVelocityRule(max_cost_usd, window_seconds)` | Circuit breaker on spend rate (e.g. $5/hour) |
+| `RestrictModelRule(disallowed_models, condition=None)` | Block calls to specific models |
+| `TagBasedModelDowngradeRule(condition, downgrade_to)` | Silently swap model based on labels |
+
+### Per-User Budgets
+
+```python
+policy = PolicyEngine(rules=[
+    PerUserBudgetRule(
+        user_budgets={"power_user": 20.0, "free_tier": 1.0},
+        default_max_usd=5.0,   # applied to any user_id not in the dict
+    ),
+])
+# user_id is read from _dl_labels={"user_id": "..."} or ambient tags
+```
+
+### Forecast-Based Blocking
+
+```python
+policy = PolicyEngine(rules=[
+    ForecastBudgetRule(monthly_budget_usd=50.0, lookback_days=7),
+])
+# Blocks before the budget is actually exhausted — proactive, not reactive
+```
+
+### Model Governance
+
+```python
+policy = PolicyEngine(rules=[
+    # Block GPT-4o on free plan users
+    RestrictModelRule(
+        disallowed_models={"gpt-4o", "gpt-4"},
+        condition=lambda ctx: ctx["labels"].get("plan") == "free",
+    ),
+    # Auto-downgrade free users to mini
+    TagBasedModelDowngradeRule(
+        condition=lambda ctx: ctx["labels"].get("plan") == "free",
+        downgrade_to="gpt-4o-mini",
+    ),
+])
+```
+
+---
+
+## Alerts
+
+Fire-and-forget notifications when policies trip or cost thresholds are crossed.
+
+```python
+from driftlock import DriftlockConfig, WebhookAlertChannel, SlackAlertChannel, LogAlertChannel
+
+config = DriftlockConfig(
+    alert_channels=[
+        SlackAlertChannel(webhook_url="https://hooks.slack.com/services/..."),
+        WebhookAlertChannel(url="https://example.com/hooks/driftlock"),
+        LogAlertChannel(),   # logs to Python logging at WARNING level
+    ]
 )
 ```
 
----
+Alert events: `policy_block`, `cost_warning`, `budget_threshold`, `velocity_trip`.
 
-## Reading Metrics
-
-```python
-# Aggregate stats (all time)
-client.stats()
-# {'calls': 42, 'total_tokens': 18500, 'total_cost_usd': 0.003245, ...}
-
-# Filter by endpoint or model
-client.stats(endpoint="summarise_article")
-client.stats(model="gpt-4o")
-
-# Filter since a timestamp (ISO 8601)
-client.stats(since="2025-03-01T00:00:00+00:00")
-
-# Recent calls
-client.recent_calls(limit=10)
-```
+Delivery failures are logged at WARNING level and never propagate to the caller.
 
 ---
 
-## FastAPI Example
+## Cost Reduction Engine
 
-See [examples/fastapi_app.py](examples/fastapi_app.py) for a working FastAPI integration.
-
-```bash
-OPENAI_API_KEY=sk-... uvicorn examples.fastapi_app:app --reload
-```
-
-Key endpoints:
-
-| Route | Description |
-|---|---|
-| `POST /chat` | Chat with GPT, tracked under `endpoint=chat` |
-| `POST /summarise` | Summarise text, tracked under `endpoint=summarise` |
-| `GET /metrics` | Aggregated stats by endpoint |
-| `GET /metrics/recent` | Last N calls |
-
----
-
-## Cost Reduction Engine v0
-
-Enable the optimization pipeline by passing an `OptimizationConfig` to `DriftlockClient`:
+Enable the optimization pipeline to automatically trim prompts, cap output, and fall back to cheaper models:
 
 ```python
 from driftlock import DriftlockClient, OptimizationConfig
@@ -155,91 +324,37 @@ client = DriftlockClient(
         keep_last_n_messages=10,         # always keep the N most recent turns
         always_keep_system=True,         # never drop the system message
         default_max_output_tokens=512,   # cap output when caller omits max_tokens
-        max_cost_per_request_usd=0.05,   # guardrail: abort if estimated cost > $0.05
+        max_cost_per_request_usd=0.05,   # abort if estimated cost > $0.05
         budget_exceeded_action="fallback",
-        fallback_model="gpt-4o-mini",    # switch to this model instead of raising
+        fallback_model="gpt-4o-mini",
     ),
 )
 ```
 
-All three features are opt-in and independent — you can enable any combination.
-
-### 1. Prompt Trimming
-
-Trims the chat history before the call to fit within `max_prompt_tokens`.
-
-**Algorithm (deterministic, in order):**
-1. Apply `keep_last_n_messages` — drop older non-system turns from the front.
-2. If still over budget, drop one non-system message at a time (oldest first) until the prompt fits.
-3. The system message is never touched when `always_keep_system=True`.
-4. At least one non-system message is always kept regardless of budget.
-
-**Tradeoffs:**
-- Dropping messages may degrade response quality (context loss). `quality_risk: true` flags this in the report.
-- Token counting uses tiktoken (accurate) or a char/4 fallback if tiktoken is unavailable.
-
-### 2. Hard Output Cap
-
-If the caller does not set `max_tokens`, Driftlock injects `default_max_output_tokens` automatically. This prevents runaway generation from open-ended prompts.
-
-**Tradeoffs:**
-- Responses may be cut off. Only enable when the call site tolerates truncated output.
-- The cap is silently skipped when the caller already sets `max_tokens`, so it never overrides explicit intent.
-
-### 3. Budget Guardrail
-
-Before every call, Driftlock estimates the total cost:
-
-```
-estimated_cost = (prompt_tokens / 1000 * input_price)
-               + (effective_max_output_tokens / 1000 * output_price)
-```
-
-If this exceeds `max_cost_per_request_usd`:
-
-| `budget_exceeded_action` | Behaviour |
-|---|---|
-| `"raise"` (default) | Raises `BudgetExceededError` before any API call is made |
-| `"fallback"` | Switches to `fallback_model` and retries the cost estimate |
-
-**Tradeoffs:**
-- The estimate is **worst-case** (assumes full output generation). Actual cost is often lower.
-- Model fallback changes response quality. `quality_risk: true` is set in the report.
-
-### Optimization Report
-
-Every call with an active pipeline appends an `optimization` block to the JSON log and to `CallMetrics`:
+Every call logs an `optimization` block showing tokens and cost saved:
 
 ```json
 {
-  "metrics": {
-    "model": "gpt-4o-mini",
-    "prompt_tokens": 142,
-    "optimization": {
-      "original_prompt_tokens": 3840,
-      "optimized_prompt_tokens": 142,
-      "tokens_saved": 3698,
-      "estimated_prompt_cost_before_usd": 0.000576,
-      "estimated_prompt_cost_after_usd": 0.0000213,
-      "cost_saved_usd": 0.0005547,
-      "optimizations_applied": ["prompt_trim", "output_cap"],
-      "quality_risk": true
-    }
+  "optimization": {
+    "original_prompt_tokens": 3840,
+    "optimized_prompt_tokens": 142,
+    "tokens_saved": 3698,
+    "cost_saved_usd": 0.0005547,
+    "optimizations_applied": ["prompt_trim", "output_cap"],
+    "quality_risk": true
   }
 }
 ```
 
-Cost savings reported are **prompt-only** (deterministic). Output cost depends on actual model generation and is tracked in `estimated_cost_usd` after the call completes.
-
 ---
 
-## Caching: exact cache (safe) vs semantic cache (future)
+## Response Cache
 
-### Exact cache (available now)
-
-Driftlock's cache stores the full response for a request and returns it unchanged on repeated identical calls.
+Exact in-memory cache (LRU + TTL). Returns stored responses for identical requests without hitting the API:
 
 ```python
+from driftlock import DriftlockClient, CacheConfig
+
 client = DriftlockClient(
     api_key="sk-...",
     cache=CacheConfig(
@@ -249,72 +364,78 @@ client = DriftlockClient(
 )
 ```
 
-**How it works:**
-- The cache key is a SHA-256 hash of `(model, messages, temperature, max_tokens, …)` — computed *after* the optimization pipeline runs, so you cache the trimmed/capped request, not the original.
-- The response object is stored in memory. No serialization, no disk I/O.
-- On a cache hit, `prompt_tokens=0`, `completion_tokens=0`, `estimated_cost_usd=0.0`. The savings are reported in `tokens_saved_prompt`, `tokens_saved_completion`, and `estimated_savings_usd`.
-- Streaming responses (`stream=True`) are never cached.
-- The `user` kwarg (OpenAI tracing, PII) is excluded from the key so different user IDs sharing the same prompt share a cache entry.
+Cache hits report `cost=$0.00` and record tokens and dollars saved. Streaming responses are never cached.
 
-**Log output on a cache hit:**
-```
-[CACHE HIT] | model=gpt-4o-mini | latency=0.1ms | saved=70tok | saved_usd=$0.000011 | endpoint=chat | key=a3f8c21d…
-```
-
-**Cache stats** are available in-memory and in the `/metrics` endpoint:
 ```python
 client.cache_stats()
-# {"enabled": True, "size": 12, "hits": 48, "misses": 14, "hit_rate": 0.7742, ...}
-
-client.stats()
-# {"calls": 62, "cache_hits": 48, "cache_hit_rate": 0.7742,
-#  "total_cost_usd": 0.0014, "total_savings_usd": 0.0052, ...}
+# {"enabled": True, "size": 12, "hits": 48, "misses": 14, "hit_rate": 0.7742}
 ```
-
-**When is an exact cache appropriate?**
-
-| Use case | Cache? |
-|---|---|
-| FAQ / help-bot with repeated questions | ✅ Yes — identical prompts, deterministic answers |
-| `temperature=0` pipelines (classification, extraction) | ✅ Yes — fully deterministic |
-| User-facing chat with creative generation (`temperature>0`) | ⚠️ Cache returns the first response every time — fine for read-heavy FAQ, wrong for conversational UX |
-| Unique documents (per-user summaries, personalised content) | ❌ No — cache miss rate near 100%, adds overhead with no benefit |
-
-**Tradeoffs:**
-- Memory: each entry holds a full `ChatCompletion` object (~1–5 KB). 1 000 entries ≈ 1–5 MB.
-- Stale responses: TTL controls how long entries live. Set lower (`60s`) for frequently-updated knowledge, higher (`3600s`) for stable FAQ content.
-- No persistence: the cache is wiped on process restart. For cross-process caching, Redis support is on the roadmap.
-
-### Ambient tagging
-
-Attach labels to all DriftlockClient calls within a scope without modifying every call site — useful in middleware:
-
-```python
-import driftlock
-
-# FastAPI middleware example
-with driftlock.tag(request_id="req_abc", user_id="u_42", feature="chat"):
-    response = client.chat.completions.create(...)
-```
-
-Tags from nested `driftlock.tag()` blocks merge; inner values override outer ones. Per-call `_dl_labels` always wins.
-
-### Semantic cache (planned)
-
-A future semantic cache will embed the prompt and return cached responses when cosine similarity exceeds a configurable threshold. This enables cache hits for paraphrased or near-duplicate prompts at the cost of occasional incorrect hits.
-
-Driftlock will implement this as a separate, explicitly opt-in backend with a `similarity_threshold` config and a `quality_risk: true` flag on hits, making the tradeoff transparent.
 
 ---
 
-## Warnings
+## Reading Metrics
 
-Driftlock emits warnings (elevated to `WARNING` log level) when:
+```python
+# Aggregate stats (all time)
+client.stats()
+# {'calls': 42, 'total_tokens': 18500, 'total_cost_usd': 0.003245, ...}
 
-- **Prompt is too large** — prompt token count exceeds `prompt_token_warning_threshold`
-- **Call is expensive** — estimated cost exceeds `cost_warning_threshold`
+# Filter by endpoint, model, or time window
+client.stats(endpoint="summarise_article")
+client.stats(model="gpt-4o")
+client.stats(since="2025-03-01T00:00:00+00:00")
 
-Warnings are also stored in the local SQLite record for later inspection.
+# Recent calls
+client.recent_calls(limit=10)
+
+# Projected monthly spend
+client.forecast(lookback_days=7)
+# {'daily_avg_usd': 0.0004, 'projected_monthly_usd': 0.012, ...}
+
+# Prompt drift detection (detect template changes by endpoint)
+client.prompt_drift(endpoint="summarise_article")
+```
+
+---
+
+## CLI
+
+Inspect telemetry without writing code:
+
+```bash
+driftlock stats                          # aggregate totals
+driftlock stats --since 7d              # last 7 days
+driftlock stats --endpoint summarise    # filter by endpoint
+driftlock recent --limit 20             # last 20 calls
+driftlock forecast --lookback 7         # projected monthly spend
+driftlock top-endpoints --since 7d      # most expensive endpoints
+driftlock top-users --since 30d         # per-user spend
+driftlock models                        # spend by model
+driftlock drift summarise_article       # prompt change history
+driftlock --db /path/to/other.db stats  # point at a different db
+```
+
+Set `DRIFTLOCK_DB_PATH` to override the default `driftlock.sqlite` path.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DRIFTLOCK_ENABLED` | `true` | Set to `false` to pass through all calls with zero overhead |
+| `DRIFTLOCK_TRACK_ONLY` | `false` | Track metrics but skip optimization and policy enforcement |
+| `DRIFTLOCK_DB_PATH` | `driftlock.sqlite` | Override the SQLite file path for CLI commands |
+
+---
+
+## FastAPI Example
+
+See [examples/fastapi_app.py](examples/fastapi_app.py) for a full integration with middleware tagging, optimization, and cache.
+
+```bash
+OPENAI_API_KEY=sk-... uvicorn examples.fastapi_app:app --reload
+```
 
 ---
 
@@ -322,28 +443,31 @@ Warnings are also stored in the local SQLite record for later inspection.
 
 ```
 driftlock/
-├── __init__.py          # Public API: DriftlockClient, DriftlockConfig, CacheConfig, tag, …
-├── client.py            # DriftlockClient + chat interceptor
-├── config.py            # DriftlockConfig dataclass
-├── metrics.py           # CallMetrics dataclass (includes cache + optimization fields)
-├── pricing.py           # Model pricing table + cost estimator
-├── storage.py           # SQLiteStorage + NoopStorage (auto-migrating schema)
+├── __init__.py          # Public API
+├── client.py            # DriftlockClient (OpenAI wrapper, sync + async)
+├── anthropic_client.py  # AnthropicDriftlockClient (opt-in)
+├── config.py            # DriftlockConfig
+├── policy.py            # PolicyEngine + all rules
+├── alerts.py            # AlertChannel, Webhook/Slack/Log implementations
+├── metrics.py           # CallMetrics dataclass
+├── pricing.py           # OpenAI + Anthropic pricing table
+├── storage.py           # SQLiteStorage + NoopStorage (auto-migrating)
+├── optimization.py      # OptimizationPipeline, OptimizationConfig
+├── cache.py             # ResponseCache (LRU+TTL), CacheConfig
+├── streaming.py         # StreamingInterceptor (deferred metrics)
+├── drift.py             # Prompt hash + drift detection
+├── cli.py               # driftlock CLI entry point
+├── context.py           # driftlock.tag() context manager
 ├── logger.py            # Structured JSON logger
-├── optimization.py      # OptimizationPipeline, OptimizationConfig, OptimizationReport
-├── tokenizer.py         # Token counting (tiktoken + char fallback)
-├── cache.py             # ResponseCache (LRU+TTL), CacheConfig, make_cache_key
-└── context.py           # driftlock.tag() context manager (ContextVar)
+├── tokenizer.py         # tiktoken + char fallback
+└── providers/           # NormalizedUsage, OpenAIProvider, AnthropicProvider
 
 examples/
-├── basic_usage.py       # Minimal script example
-└── fastapi_app.py       # FastAPI with middleware tagging + optimization + cache
+├── basic_usage.py
+├── fastapi_app.py
+└── dashboard_app.py
 
-tests/
-├── test_pricing.py
-├── test_client.py
-├── test_storage.py
-├── test_optimization.py
-└── test_cache.py        # LRU, TTL, key stability, context tags, client integration
+tests/                   # 131 tests
 ```
 
 ---
@@ -352,20 +476,28 @@ tests/
 
 | Feature | Status |
 |---|---|
-| OpenAI chat wrapper | ✅ |
-| Token tracking | ✅ |
-| Cost estimation | ✅ |
+| OpenAI chat wrapper (sync + async) | ✅ |
+| Anthropic Messages wrapper (sync + async) | ✅ |
+| Token tracking + cost estimation | ✅ |
 | Latency measurement | ✅ |
-| SQLite storage | ✅ |
+| SQLite storage (auto-migrating) | ✅ |
 | Structured JSON logging | ✅ |
-| Prompt-length warnings | ✅ |
-| Cost-per-call warnings | ✅ |
-| Async (`acreate`) support | Planned |
-| Anthropic / Gemini adapters | Planned |
-| Smart model routing | Planned |
-| Prompt compression hooks | Planned |
-| Per-user / per-team budget caps | Planned |
+| Policy engine (budget, velocity, model) | ✅ |
+| Per-user / per-team budget caps | ✅ |
+| Forecast-based budget blocking | ✅ |
+| Velocity + cost circuit breakers | ✅ |
+| Prompt optimization pipeline | ✅ |
+| Exact in-memory response cache | ✅ |
+| Streaming support | ✅ |
+| Prompt drift detection | ✅ |
+| Alert channels (Slack, Webhook, Log) | ✅ |
+| Ambient tagging context manager | ✅ |
+| CLI (stats, forecast, drift, top-users) | ✅ |
 | OpenTelemetry export | Planned |
+| Redis cache backend | Planned |
+| Semantic (embedding-based) cache | Planned |
+| Gemini adapter | Planned |
+| PyPI release | Planned |
 
 ---
 

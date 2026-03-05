@@ -1,0 +1,2 @@
+[console_scripts]
+driftlock = driftlock.cli:main

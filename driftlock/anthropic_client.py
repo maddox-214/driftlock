@@ -1,36 +1,44 @@
 """
-DriftlockClient — a transparent wrapper around multiple different LLM providers (currently just OpenAI) that adds:
+AnthropicDriftlockClient — transparent wrapper around the Anthropic Python SDK.
 
 Usage::
 
-    from driftlock import DriftlockClient, DriftlockConfig, OptimizationConfig, CacheConfig
+    from driftlock import AnthropicDriftlockClient, DriftlockConfig
 
-    client = DriftlockClient(
-        api_key="sk-...",
-        optimization=OptimizationConfig(max_prompt_tokens=3000),
-        cache=CacheConfig(ttl_seconds=600),
+    client = AnthropicDriftlockClient(
+        api_key="sk-ant-...",
+        config=DriftlockConfig(),
     )
 
-    # Optionally set ambient tags for a whole block (e.g. from middleware):
-    with driftlock.tag(request_id="req_123", user_id="u_42"):
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": "Hello!"}],
-            _dl_endpoint="my_function",   # per-call label
-            _dl_labels={"env": "prod"},   # per-call labels
-        )
+    response = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": "Hello!"}],
+        _dl_endpoint="my_function",
+        _dl_labels={"env": "prod"},
+    )
+
+The Anthropic Messages API differences from OpenAI:
+  - ``max_tokens`` is required (Anthropic enforces this)
+  - ``system`` is a top-level kwarg, not a message role
+  - Response uses ``usage.input_tokens`` / ``usage.output_tokens``
 """
 
-import hashlib
+from __future__ import annotations
+
 import os
 import time
 import uuid
 from typing import Any
 
-from openai import AsyncOpenAI, OpenAI
-from openai.types.chat import ChatCompletion
+try:
+    from anthropic import Anthropic, AsyncAnthropic
+except ImportError as _e:  # pragma: no cover
+    raise ImportError(
+        "anthropic package is required for AnthropicDriftlockClient. "
+        "Install it with: pip install 'driftlock[anthropic]'"
+    ) from _e
 
-from .alerts import ALERT_COST_WARNING, ALERT_POLICY_BLOCK, fire_alert
 from .cache import CacheConfig, ResponseCache, make_cache_key
 from .config import DriftlockConfig
 from .context import get_active_tags
@@ -40,60 +48,29 @@ from .metrics import CallMetrics
 from .optimization import OptimizationConfig, OptimizationPipeline
 from .policy import PolicyEngine, PolicyViolationError
 from .pricing import estimate_cost
-from .providers.openai_provider import OpenAIProvider
+from .providers.anthropic_provider import AnthropicProvider
 from .storage import NoopStorage, SQLiteStorage
-from .streaming import StreamingInterceptor
-from .tokenizer import count_messages_tokens
-
-_PROVIDER = OpenAIProvider()
+from .client import _env_flag, _is_sampled_in, _sample_key_value
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() not in {"0", "false", "no", "off"}
+_PROVIDER = AnthropicProvider()
 
 
-def _sample_key_value(sample_key: str, labels: dict, kwargs: dict) -> str:
-    if sample_key in labels:
-        return str(labels[sample_key])
-    if sample_key in kwargs:
-        return str(kwargs[sample_key])
-    return "unknown"
+class _AnthropicMessagesWrapper:
+    """Intercepts messages.create calls for Anthropic."""
 
-
-def _is_sampled_in(sample_value: str, rate: float) -> bool:
-    if rate >= 1.0:
-        return True
-    if rate <= 0.0:
-        return False
-    digest = hashlib.sha256(sample_value.encode()).digest()
-    bucket = int.from_bytes(digest[:8], "big") / 2**64
-    return bucket < rate
-
-
-class _ChatCompletionsWrapper:
-    """Intercepts chat.completions.create / acreate calls."""
-
-    def __init__(
-        self,
-        sync_completions,
-        async_completions,
-        client: "DriftlockClient",
-    ) -> None:
-        self._sync = sync_completions
-        self._async = async_completions
+    def __init__(self, sync_messages, async_messages, client: "AnthropicDriftlockClient") -> None:
+        self._sync = sync_messages
+        self._async = async_messages
         self._dl = client
 
-    def create(self, *args, **kwargs) -> ChatCompletion:
+    def create(self, *args, **kwargs) -> Any:
         # ------------------------------------------------------------------ #
         # 1. Strip Driftlock-only kwargs
         # ------------------------------------------------------------------ #
         endpoint: str | None = kwargs.pop("_dl_endpoint", None)
         labels: dict = kwargs.pop("_dl_labels", {})
 
-        # Merge precedence: default_labels < context tags < per-call labels
         merged_labels: dict = {
             **self._dl._config.default_labels,
             **get_active_tags(),
@@ -107,8 +84,16 @@ class _ChatCompletionsWrapper:
             return self._sync.create(*args, **kwargs)
 
         # ------------------------------------------------------------------ #
-        # 2. Optimization pipeline (trimming → output cap → budget guardrail)
+        # 2. Normalize messages for optimization pipeline
+        #    Anthropic passes system as a top-level kwarg, not inside messages.
+        #    We inject it as a synthetic system message for token counting /
+        #    trimming, then strip it back out before the API call.
         # ------------------------------------------------------------------ #
+        system_text: str | None = kwargs.pop("system", None)
+        messages: list[dict] = list(kwargs.get("messages", []))
+        if system_text:
+            messages = [{"role": "system", "content": system_text}] + messages
+
         opt_report = None
         policy_decisions: list[dict] = []
         optimization_enabled = False
@@ -129,7 +114,7 @@ class _ChatCompletionsWrapper:
 
             model, messages, kwargs, opt_report = optimizer.process(
                 model=kwargs.get("model", "unknown"),
-                messages=kwargs.get("messages", []),
+                messages=messages,
                 kwargs=kwargs,
                 apply=apply,
                 shadow_mode=optimization_shadow,
@@ -138,11 +123,23 @@ class _ChatCompletionsWrapper:
                 opt_report.bypassed_reason = "sampled_out"
 
             kwargs["model"] = model
-            kwargs["messages"] = messages
             optimization_enabled = not sampled_out
 
+        # Extract system message back out (Anthropic requires it as a kwarg)
+        non_system = [m for m in messages if m.get("role") != "system"]
+        remaining_system = [m for m in messages if m.get("role") == "system"]
+        kwargs["messages"] = non_system
+        if remaining_system:
+            # Re-attach system text (concatenate if multiple were kept)
+            kwargs["system"] = "\n\n".join(
+                m["content"] for m in remaining_system if isinstance(m.get("content"), str)
+            )
+        elif system_text and not (optimizer and opt_report):
+            # No optimizer ran; restore the original system kwarg
+            kwargs["system"] = system_text
+
         # ------------------------------------------------------------------ #
-        # 3. Policy evaluation (after optimization, before cache)
+        # 3. Policy evaluation
         # ------------------------------------------------------------------ #
         if self._dl._policy is not None:
             ctx = {
@@ -163,11 +160,6 @@ class _ChatCompletionsWrapper:
                     }
                 )
                 if not decision.allow or decision.action == "block":
-                    fire_alert(
-                        self._dl._config.alert_channels,
-                        ALERT_POLICY_BLOCK,
-                        {"rule": rule_name, "model": kwargs.get("model"), **decision.metadata},
-                    )
                     raise PolicyViolationError(rule_name, decision)
                 if decision.action in {"downgrade", "fallback"}:
                     target = (
@@ -177,10 +169,9 @@ class _ChatCompletionsWrapper:
                     )
                     if target:
                         kwargs["model"] = target
-                        ctx["model"] = target
 
         # ------------------------------------------------------------------ #
-        # 4. Cache lookup (key computed AFTER optimization)
+        # 4. Cache lookup (key computed after optimization)
         # ------------------------------------------------------------------ #
         cache_key: str | None = None
         if cache is not None and not kwargs.get("stream", False):
@@ -199,7 +190,7 @@ class _ChatCompletionsWrapper:
                     model_name, entry.prompt_tokens, entry.completion_tokens
                 )
                 metrics = CallMetrics(
-                    provider="openai",
+                    provider="anthropic",
                     model=model_name,
                     prompt_tokens=0,
                     completion_tokens=0,
@@ -228,44 +219,24 @@ class _ChatCompletionsWrapper:
         # 5. Cache miss — call the real API
         # ------------------------------------------------------------------ #
         start = time.perf_counter()
-
-        # Streaming: wrap response for deferred token counting
-        if kwargs.get("stream", False):
-            pre_tokens = count_messages_tokens(kwargs.get("messages", []), kwargs.get("model", "gpt-4o"))
-            raw_stream = self._sync.create(*args, **kwargs)
-            return StreamingInterceptor(
-                stream=raw_stream,
-                model=kwargs.get("model", "unknown"),
-                messages=kwargs.get("messages", []),
-                pre_call_prompt_tokens=pre_tokens,
-                start_time=start,
-                endpoint=endpoint,
-                labels=merged_labels,
-                storage=self._dl._storage,
-                logger=self._dl._logger,
-                config=self._dl._config,
-                optimization_report=opt_report,
-                policy_decisions=policy_decisions,
-            )
-
-        response: ChatCompletion = self._sync.create(*args, **kwargs)
+        response = self._sync.create(*args, **kwargs)
         latency_ms = (time.perf_counter() - start) * 1000
 
-        norm = _PROVIDER.normalize_response(response)
+        usage = _PROVIDER.normalize_response(response)
 
         if cache is not None and cache_key is not None:
-            cache.put(cache_key, response, norm.prompt_tokens, norm.completion_tokens)
+            cache.put(cache_key, response, usage.prompt_tokens, usage.completion_tokens)
 
         # ------------------------------------------------------------------ #
         # 6. Metrics, warnings, logging, storage
         # ------------------------------------------------------------------ #
-        cost = estimate_cost(norm.model, norm.prompt_tokens, norm.completion_tokens)
+        cost = estimate_cost(usage.model, usage.prompt_tokens, usage.completion_tokens)
         cfg = self._dl._config
         warnings: list[str] = []
 
-        if norm.prompt_tokens > cfg.prompt_token_warning_threshold:
+        if usage.prompt_tokens > cfg.prompt_token_warning_threshold:
             warnings.append(
-                f"Prompt is large: {norm.prompt_tokens} tokens "
+                f"Prompt is large: {usage.prompt_tokens} tokens "
                 f"(threshold: {cfg.prompt_token_warning_threshold})"
             )
         if cfg.cost_warning_threshold and cost and cost > cfg.cost_warning_threshold:
@@ -273,20 +244,15 @@ class _ChatCompletionsWrapper:
                 f"Call cost ${cost:.6f} exceeds warning threshold "
                 f"${cfg.cost_warning_threshold:.6f}"
             )
-            fire_alert(
-                cfg.alert_channels,
-                ALERT_COST_WARNING,
-                {"model": norm.model, "cost_usd": cost, "threshold_usd": cfg.cost_warning_threshold},
-            )
 
-        p_hash = hash_prompt(kwargs.get("messages", []))
+        p_hash = hash_prompt(kwargs.get("messages", []), kwargs.get("system"))
 
         metrics = CallMetrics(
-            provider="openai",
-            model=norm.model,
-            prompt_tokens=norm.prompt_tokens,
-            completion_tokens=norm.completion_tokens,
-            total_tokens=norm.prompt_tokens + norm.completion_tokens,
+            provider="anthropic",
+            model=usage.model,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.prompt_tokens + usage.completion_tokens,
             latency_ms=latency_ms,
             estimated_cost_usd=cost,
             endpoint=endpoint,
@@ -305,12 +271,12 @@ class _ChatCompletionsWrapper:
         self._dl._storage.save(metrics)
         return response
 
-    async def acreate(self, *args, **kwargs) -> ChatCompletion:
-        """Async version of create().  Uses AsyncOpenAI under the hood."""
+    async def acreate(self, *args, **kwargs) -> Any:
+        """Async version of create().  Requires AsyncAnthropic under the hood."""
         import asyncio
 
         # ------------------------------------------------------------------ #
-        # 1. Strip Driftlock-only kwargs
+        # 1. Strip Driftlock-only kwargs (sync — trivial)
         # ------------------------------------------------------------------ #
         endpoint: str | None = kwargs.pop("_dl_endpoint", None)
         labels: dict = kwargs.pop("_dl_labels", {})
@@ -327,9 +293,11 @@ class _ChatCompletionsWrapper:
         if not enabled and not track_only:
             return await self._async.create(*args, **kwargs)
 
-        # ------------------------------------------------------------------ #
-        # 2. Optimization pipeline
-        # ------------------------------------------------------------------ #
+        system_text: str | None = kwargs.pop("system", None)
+        messages: list[dict] = list(kwargs.get("messages", []))
+        if system_text:
+            messages = [{"role": "system", "content": system_text}] + messages
+
         opt_report = None
         policy_decisions: list[dict] = []
         optimization_enabled = False
@@ -350,7 +318,7 @@ class _ChatCompletionsWrapper:
 
             model, messages, kwargs, opt_report = optimizer.process(
                 model=kwargs.get("model", "unknown"),
-                messages=kwargs.get("messages", []),
+                messages=messages,
                 kwargs=kwargs,
                 apply=apply,
                 shadow_mode=optimization_shadow,
@@ -359,12 +327,18 @@ class _ChatCompletionsWrapper:
                 opt_report.bypassed_reason = "sampled_out"
 
             kwargs["model"] = model
-            kwargs["messages"] = messages
             optimization_enabled = not sampled_out
 
-        # ------------------------------------------------------------------ #
-        # 3. Policy evaluation
-        # ------------------------------------------------------------------ #
+        non_system = [m for m in messages if m.get("role") != "system"]
+        remaining_system = [m for m in messages if m.get("role") == "system"]
+        kwargs["messages"] = non_system
+        if remaining_system:
+            kwargs["system"] = "\n\n".join(
+                m["content"] for m in remaining_system if isinstance(m.get("content"), str)
+            )
+        elif system_text and not (optimizer and opt_report):
+            kwargs["system"] = system_text
+
         if self._dl._policy is not None:
             ctx = {
                 "model": kwargs.get("model", "unknown"),
@@ -384,11 +358,6 @@ class _ChatCompletionsWrapper:
                     }
                 )
                 if not decision.allow or decision.action == "block":
-                    fire_alert(
-                        self._dl._config.alert_channels,
-                        ALERT_POLICY_BLOCK,
-                        {"rule": rule_name, "model": kwargs.get("model"), **decision.metadata},
-                    )
                     raise PolicyViolationError(rule_name, decision)
                 if decision.action in {"downgrade", "fallback"}:
                     target = (
@@ -399,9 +368,6 @@ class _ChatCompletionsWrapper:
                     if target:
                         kwargs["model"] = target
 
-        # ------------------------------------------------------------------ #
-        # 4. Cache lookup
-        # ------------------------------------------------------------------ #
         cache_key: str | None = None
         if cache is not None and not kwargs.get("stream", False):
             cache_key = make_cache_key(
@@ -416,7 +382,7 @@ class _ChatCompletionsWrapper:
                     model_name, entry.prompt_tokens, entry.completion_tokens
                 )
                 metrics = CallMetrics(
-                    provider="openai",
+                    provider="anthropic",
                     model=model_name,
                     prompt_tokens=0,
                     completion_tokens=0,
@@ -439,28 +405,22 @@ class _ChatCompletionsWrapper:
                 await asyncio.to_thread(self._dl._storage.save, metrics)
                 return entry.response
 
-        # ------------------------------------------------------------------ #
-        # 5. Cache miss — async API call
-        # ------------------------------------------------------------------ #
         start = time.perf_counter()
-        response: ChatCompletion = await self._async.create(*args, **kwargs)
+        response = await self._async.create(*args, **kwargs)
         latency_ms = (time.perf_counter() - start) * 1000
 
-        norm = _PROVIDER.normalize_response(response)
+        usage = _PROVIDER.normalize_response(response)
 
         if cache is not None and cache_key is not None:
-            cache.put(cache_key, response, norm.prompt_tokens, norm.completion_tokens)
+            cache.put(cache_key, response, usage.prompt_tokens, usage.completion_tokens)
 
-        # ------------------------------------------------------------------ #
-        # 6. Metrics, logging, storage
-        # ------------------------------------------------------------------ #
-        cost = estimate_cost(norm.model, norm.prompt_tokens, norm.completion_tokens)
+        cost = estimate_cost(usage.model, usage.prompt_tokens, usage.completion_tokens)
         cfg = self._dl._config
         warnings: list[str] = []
 
-        if norm.prompt_tokens > cfg.prompt_token_warning_threshold:
+        if usage.prompt_tokens > cfg.prompt_token_warning_threshold:
             warnings.append(
-                f"Prompt is large: {norm.prompt_tokens} tokens "
+                f"Prompt is large: {usage.prompt_tokens} tokens "
                 f"(threshold: {cfg.prompt_token_warning_threshold})"
             )
         if cfg.cost_warning_threshold and cost and cost > cfg.cost_warning_threshold:
@@ -469,14 +429,14 @@ class _ChatCompletionsWrapper:
                 f"${cfg.cost_warning_threshold:.6f}"
             )
 
-        p_hash = hash_prompt(kwargs.get("messages", []))
+        p_hash = hash_prompt(kwargs.get("messages", []), kwargs.get("system"))
 
         metrics = CallMetrics(
-            provider="openai",
-            model=norm.model,
-            prompt_tokens=norm.prompt_tokens,
-            completion_tokens=norm.completion_tokens,
-            total_tokens=norm.prompt_tokens + norm.completion_tokens,
+            provider="anthropic",
+            model=usage.model,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.prompt_tokens + usage.completion_tokens,
             latency_ms=latency_ms,
             estimated_cost_usd=cost,
             endpoint=endpoint,
@@ -496,29 +456,28 @@ class _ChatCompletionsWrapper:
         return response
 
 
-class _ChatWrapper:
+class _AnthropicMessagesClientWrapper:
     def __init__(
         self,
-        sync_chat,
-        async_chat,
-        client: "DriftlockClient",
+        sync_client: Anthropic,
+        async_client: AsyncAnthropic,
+        dl_client: "AnthropicDriftlockClient",
     ) -> None:
-        self.completions = _ChatCompletionsWrapper(
-            sync_chat.completions,
-            async_chat.completions,
-            client,
+        self.messages = _AnthropicMessagesWrapper(
+            sync_client.messages,
+            async_client.messages,
+            dl_client,
         )
 
 
-class DriftlockClient:
+class AnthropicDriftlockClient:
     """
-    Drop-in wrapper around openai.OpenAI.
+    Drop-in wrapper around anthropic.Anthropic.
 
     Adds token tracking, cost estimation, latency measurement, structured
-    logging, an optional pre-call optimization pipeline, and an optional
-    exact in-memory response cache.
+    logging, an optional optimization pipeline, cache, and policy engine.
 
-    All kwargs not listed below are forwarded to openai.OpenAI.
+    All kwargs not listed below are forwarded to anthropic.Anthropic.
     """
 
     def __init__(
@@ -528,11 +487,11 @@ class DriftlockClient:
         optimization: OptimizationConfig | None = None,
         cache: CacheConfig | None = None,
         policy: PolicyEngine | None = None,
-        **openai_kwargs: Any,
+        **anthropic_kwargs: Any,
     ) -> None:
         self._config = config or DriftlockConfig()
-        self._openai = OpenAI(**openai_kwargs)
-        self._async_openai = AsyncOpenAI(**openai_kwargs)
+        self._sync_anthropic = Anthropic(**anthropic_kwargs)
+        self._async_anthropic = AsyncAnthropic(**anthropic_kwargs)
         self._logger = DriftlockLogger(
             log_json=self._config.log_json,
             log_level=self._config.log_level,
@@ -549,10 +508,12 @@ class DriftlockClient:
         else:
             self._storage = NoopStorage()
 
-        self.chat = _ChatWrapper(self._openai.chat, self._async_openai.chat, self)
+        self.messages = _AnthropicMessagesClientWrapper(
+            self._sync_anthropic, self._async_anthropic, self
+        ).messages
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._openai, name)
+        return getattr(self._sync_anthropic, name)
 
     def stats(
         self,
@@ -560,51 +521,17 @@ class DriftlockClient:
         model: str | None = None,
         since: str | None = None,
     ) -> dict:
-        """Return aggregated metrics from local storage (includes cache savings)."""
-        return self._storage.aggregate(endpoint=endpoint, model=model, since=since)
+        """Return aggregated metrics from local storage."""
+        return self._storage.aggregate(
+            endpoint=endpoint, model=model, provider="anthropic", since=since
+        )
 
     def recent_calls(self, limit: int = 20) -> list[dict]:
         """Return the N most recent tracked calls."""
         return self._storage.recent(limit=limit)
 
     def cache_stats(self) -> dict:
-        """Return live cache hit/miss stats (in-memory only, not persisted)."""
+        """Return live cache hit/miss stats."""
         if self._cache is None:
             return {"enabled": False}
         return {"enabled": True, **self._cache.stats()}
-
-    def forecast(self, lookback_days: int = 7) -> dict:
-        """
-        Extrapolate current daily spend rate to a full 30-day month.
-
-        Returns:
-          - daily_avg_usd: average spend per day over the lookback window
-          - projected_monthly_usd: daily_avg * 30
-          - lookback_days: number of days used for the estimate
-          - data_points: number of days with recorded data
-        """
-        trend = self._storage.daily_cost_trend(lookback_days=lookback_days)
-        if not trend:
-            return {
-                "daily_avg_usd": 0.0,
-                "projected_monthly_usd": 0.0,
-                "lookback_days": lookback_days,
-                "data_points": 0,
-            }
-        total = sum(d["cost_usd"] for d in trend)
-        daily_avg = total / lookback_days
-        return {
-            "daily_avg_usd": round(daily_avg, 6),
-            "projected_monthly_usd": round(daily_avg * 30, 4),
-            "lookback_days": lookback_days,
-            "data_points": len(trend),
-        }
-
-    def prompt_drift(self, endpoint: str, limit: int = 30) -> list[dict]:
-        """
-        Return a list of prompt hash change events for an endpoint.
-        Each entry has: timestamp, old_hash, new_hash, prompt_tokens.
-        """
-        from .drift import detect_drift
-        history = self._storage.prompt_hash_history(endpoint, limit=limit)
-        return detect_drift(history)
