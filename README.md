@@ -8,24 +8,20 @@ Driftlock sits between your application and LLM providers (OpenAI, Anthropic). I
 
 ## Install
 
-Not yet on PyPI. Install directly from source:
-
 ```bash
-git clone https://github.com/your-org/driftlock
-cd driftlock
-pip install -e .
+pip install driftlock
 ```
 
 With Anthropic support:
 
 ```bash
-pip install -e ".[anthropic]"
+pip install "driftlock[anthropic]"
 ```
 
 With FastAPI support:
 
 ```bash
-pip install -e ".[fastapi]"
+pip install "driftlock[fastapi]"
 ```
 
 Requires Python ≥ 3.11.
@@ -33,6 +29,8 @@ Requires Python ≥ 3.11.
 ---
 
 ## Try It Now (no API key needed)
+
+Clone the repo and run the full interactive demo:
 
 ```bash
 git clone https://github.com/your-org/driftlock && cd driftlock
@@ -497,7 +495,7 @@ tests/                   # 131 tests
 | Redis cache backend | Planned |
 | Semantic (embedding-based) cache | Planned |
 | Gemini adapter | Planned |
-| PyPI release | Planned |
+| PyPI release | ✅ |
 
 ---
 
